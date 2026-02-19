@@ -28,11 +28,8 @@ import { type ExecFileException, execFile } from "node:child_process";
 import { env, platform } from "node:process";
 import type { HomebridgePluginLogging } from "../util.js";
 import type { Logging } from "homebridge";
-import { promisify } from "node:util";
 import { readFileSync } from "node:fs";
-
-// Promisified execFile, created once at module level rather than per-invocation.
-const execFileAsync = promisify(execFile);
+import util from "node:util";
 
 /**
  * Options for configuring FFmpeg probing.
@@ -101,7 +98,7 @@ export class FfmpegCodecs {
   private _hostSystem?: string;
   private _cpuGeneration?: number;
   private readonly log: HomebridgePluginLogging | Logging;
-  private readonly ffmpegCodecs: Record<string, { decoders: Set<string>; encoders: Set<string> }>;
+  private readonly ffmpegCodecs: Record<string, { decoders: string[]; encoders: string[] }>;
   private readonly ffmpegHwAccels: Set<string>;
 
   /**
@@ -202,7 +199,7 @@ export class FfmpegCodecs {
     decoder = decoder.toLowerCase();
 
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    return this.ffmpegCodecs[codec]?.decoders.has(decoder) ?? false;
+    return this.ffmpegCodecs[codec]?.decoders.some(x => x === decoder) ?? false;
   }
 
   /**
@@ -230,7 +227,7 @@ export class FfmpegCodecs {
     encoder = encoder.toLowerCase();
 
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    return this.ffmpegCodecs[codec]?.encoders.has(encoder) ?? false;
+    return this.ffmpegCodecs[codec]?.encoders.some(x => x === encoder) ?? false;
   }
 
   /**
@@ -283,7 +280,7 @@ export class FfmpegCodecs {
   }
 
   /**
-   * Returns the CPU generation if we're on Linux and have an Intel processor or on macOS and have an Apple Silicon processor.
+   * Returns the CPU generation if we're on Linux and have an Intel processor or on macOS and have an Apple Silicon or Intel processor.
    *
    * @returns Returns the CPU generation or 0 if it can't be detected or an invalid platform.
    */
@@ -366,10 +363,10 @@ export class FfmpegCodecs {
 
     return this.probeCmd(this.ffmpegExec, [ "-hide_banner", "-codecs" ], (stdout: string) => {
 
-      // A regular expression to parse out the codec and its supported decoders.
+      // A regular expression to parse out the codec and it's supported decoders.
       const decodersRegex = /\S+\s+(\S+).+\(decoders: (.*?)\s*\)/;
 
-      // A regular expression to parse out the codec and its supported encoders.
+      // A regular expression to parse out the codec and it's supported encoders.
       const encodersRegex = /\S+\s+(\S+).+\(encoders: (.*?)\s*\)/;
 
       // Iterate through each line, and a build a list of encoders.
@@ -384,23 +381,17 @@ export class FfmpegCodecs {
         // If we found decoders, add them to our list of supported decoders for this format.
         if(decodersMatch) {
 
-          this.ffmpegCodecs[decodersMatch[1]] ??= { decoders: new Set(), encoders: new Set() };
+          this.ffmpegCodecs[decodersMatch[1]] = { decoders: [], encoders: [] };
 
-          for(const decoder of decodersMatch[2].split(" ")) {
-
-            this.ffmpegCodecs[decodersMatch[1]].decoders.add(decoder.toLowerCase());
-          }
+          this.ffmpegCodecs[decodersMatch[1]].decoders = decodersMatch[2].split(" ").map(x => x.toLowerCase());
         }
 
-        // If we found encoders, add them to our list of supported encoders for this format.
+        // If we found decoders, add them to our list of supported decoders for this format.
         if(encodersMatch) {
 
-          this.ffmpegCodecs[encodersMatch[1]] ??= { decoders: new Set(), encoders: new Set() };
-
-          for(const encoder of encodersMatch[2].split(" ")) {
-
-            this.ffmpegCodecs[encodersMatch[1]].encoders.add(encoder.toLowerCase());
-          }
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+          this.ffmpegCodecs[encodersMatch[1]] ||= { decoders: [], encoders: [] };
+          this.ffmpegCodecs[encodersMatch[1]].encoders = encodersMatch[2].split(" ").map(x => x.toLowerCase());
         }
       }
     });
@@ -408,9 +399,38 @@ export class FfmpegCodecs {
 
   // Identify what hardware and operating system environment we're actually running on.
   private probeHwOs(): void {
-
-    // Retrieve the CPU model string once to avoid repeated allocations from cpus().
-    const cpuModelString = cpus()[0].model;
+      
+    // Utility to identify what generation of Intel CPU we have if we're on Intel.
+    const intelCpuGeneration = () => {
+      
+      // Extract the CPU model.
+      const cpuModel = cpus()[0].model.match(/Intel.*Core.*i\d+-(\d{3,5})/i);
+      
+      this._cpuGeneration = 0;
+      
+      if (cpuModel && cpuModel[1]) {
+        
+        // Grab the individual SKU as both a number and string.
+        const skuStr = cpuModel[1];
+        
+        const skuNum = Number(skuStr);
+        
+        // Now deduce the CPU generation.
+        if (skuNum < 1000) {
+          
+          // First generation CPUs are three digit SKUs.
+          return 1;
+        } else if (skuStr.length > 4) {
+          
+          // For five-digit SKUs, the generation are the leading digits before the last three.
+          return Number(skuStr.slice(0, skuStr.length - 3));
+        } else {
+          
+          // Finally, for four-digit SKUs, the generation is the first digit.
+          return Number(skuStr.charAt(0));
+        }
+      }
+    }
 
     // Take a look at the platform we're on for an initial hint of what we are.
     switch(platform) {
@@ -418,13 +438,13 @@ export class FfmpegCodecs {
       // The beloved macOS.
       case "darwin":
 
-        this._hostSystem = "macOS." + (cpuModelString.includes("Apple") ? "Apple" : "Intel");
+        this._hostSystem = "macOS." + (cpus()[0].model.includes("Apple") ? "Apple" : "Intel");
 
         // Identify what generation of Apple Silicon we have.
-        if(cpuModelString.includes("Apple")) {
+        if(cpus()[0].model.includes("Apple")) {
 
           // Extract the CPU model.
-          const cpuModel = /Apple M(\d+) .*/i.exec(cpuModelString);
+          const cpuModel = /Apple M(\d+) .*/i.exec(cpus()[0].model);
 
           this._cpuGeneration = 0;
 
@@ -432,6 +452,10 @@ export class FfmpegCodecs {
 
             this._cpuGeneration = Number(cpuModel[1]);
           }
+        } else {
+          
+          // Identify what generation of Intel CPU we have if we're on Intel.
+          this._cpuGeneration = intelCpuGeneration();
         }
 
         break;
@@ -456,34 +480,9 @@ export class FfmpegCodecs {
         }
 
         // Identify what generation of Intel CPU we have if we're on Intel.
-        if(cpuModelString.includes("Intel")) {
+        if(cpus()[0].model.includes("Intel")) {
 
-          // Extract the CPU model.
-          const cpuModel = /Intel.*Core.*i\d+-(\d{3,5})/i.exec(cpuModelString);
-
-          this._cpuGeneration = 0;
-
-          if(cpuModel?.[1]) {
-
-            // Grab the individual SKU as both a number and string.
-            const skuStr = cpuModel[1];
-            const skuNum = Number(skuStr);
-
-            // Now deduce the CPU generation.
-            if(skuNum < 1000) {
-
-              // First generation CPUs are three digit SKUs.
-              this._cpuGeneration = 1;
-            } else if(skuStr.length > 4) {
-
-              // For five-digit SKUs, the generation are the leading digits before the last three.
-              this._cpuGeneration = Number(skuStr.slice(0, skuStr.length - 3));
-            } else {
-
-              // Finally, for four-digit SKUs, the generation is the first digit.
-              this._cpuGeneration = Number(skuStr.charAt(0));
-            }
-          }
+          this._cpuGeneration = this.intelCpuGeneration();
         }
 
         break;
@@ -516,8 +515,11 @@ export class FfmpegCodecs {
 
     try {
 
+      // Promisify exec to allow us to wait for it asynchronously.
+      const execAsync = util.promisify(execFile);
+
       // Check for the codecs in our video processor.
-      const { stdout } = await execFileAsync(command, commandLineArgs);
+      const { stdout } = await execAsync(command, commandLineArgs);
 
       processOutput(stdout);
 
@@ -529,14 +531,12 @@ export class FfmpegCodecs {
       if(execError.code === "ENOENT") {
 
         this.log.error("Unable to find '%s' in path: '%s'.", command, env.PATH);
-
-        return false;
       } else if(quietRunErrors) {
 
         return false;
       } else {
 
-        this.log.error("Error running %s: %s.", command, execError.message.replace(/\.$/, ""));
+        this.log.error("Error running %s: %s", command, execError.message);
       }
 
       this.log.error("Unable to probe the capabilities of your Homebridge host without access to '%s'. Ensure that it is available in your path and correctly working.",
